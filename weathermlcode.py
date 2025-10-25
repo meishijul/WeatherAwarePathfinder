@@ -8,6 +8,7 @@ from tf_keras.layers import Input, Conv2D, MaxPooling2D, UpSampling2D, Concatena
 from tf_keras.optimizers import Adam
 from tf_keras.preprocessing.image import ImageDataGenerator  
 from tf_keras.utils import to_categorical, load_img, img_to_array
+from transformers import TFUNetForImageSegmentation, UNetFeatureExtractor
 
 # Path to the CSV file
 csv_file_path = 'OctoberHackathonData.csv'
@@ -115,7 +116,33 @@ except Exception as e:
             model = unet_model()
             model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=10, batch_size=16)
 
-            # Save the model
+            # Load a pre-trained U-Net model from Hugging Face
+            # Initialize the feature extractor and model
+            feature_extractor = UNetFeatureExtractor.from_pretrained("hf-internal-testing/tiny-random-unet")
+            model = TFUNetForImageSegmentation.from_pretrained("hf-internal-testing/tiny-random-unet")
+
+            # Preprocess images for the U-Net model
+            def preprocess_images_unet(image_paths, feature_extractor):
+                images = []
+                for image_path in image_paths:
+                    img = load_img(image_path)
+                    img_array = img_to_array(img) / 255.0
+                    images.append(img_array)
+                inputs = feature_extractor(images, return_tensors="tf")
+                return inputs
+
+            # Load and preprocess future images
+            future_image_paths = [os.path.join(future_images_folder, img) for img in image_names]
+            inputs = preprocess_images_unet(future_image_paths, feature_extractor)
+
+            # Perform inference on future images
+            outputs = model(**inputs)
+            predictions = np.argmax(outputs.logits, axis=-1)
+
+            # Print predictions for future images
+            for image_name, prediction in zip(image_names, predictions):
+                label = "dusty" if prediction == 1 else "clear"
+                print(f"Image: {image_name}, Predicted Label: {label}")
             model.save('unet_model.h5')
             # Load a pre-trained Segformer model from Hugging Face
             feature_extractor = SegformerFeatureExtractor.from_pretrained("nvidia/segformer-b0-finetuned-ade-512-512")
