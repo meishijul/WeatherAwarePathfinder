@@ -101,9 +101,18 @@ def predict_and_fill_labels(model, future_dir, prediction_csv):
     """
     Reads predictionimages.csv (columns: image, label, date),
     predicts labels for images in future_dir, and writes labels into the middle column.
+    Works whether the first row is a header or data.
     """
     # 1) Collect all future images and make predictions
-    future_paths = list_image_paths(future_dir)
+    exts = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
+    if not os.path.isdir(future_dir):
+        print(f"No directory '{future_dir}'.")
+        return
+    future_paths = [
+        os.path.join(future_dir, f)
+        for f in os.listdir(future_dir)
+        if f.lower().endswith(exts) and os.path.isfile(os.path.join(future_dir, f))
+    ]
     if not future_paths:
         print(f"No images found in '{future_dir}'. Skipping future inference.")
         return
@@ -114,58 +123,64 @@ def predict_and_fill_labels(model, future_dir, prediction_csv):
         .batch(BATCH_SIZE)
         .prefetch(tf.data.AUTOTUNE)
     )
-
     probs = model.predict(ds, verbose=0).ravel()
     preds = (probs >= 0.5).astype(int)
     labels = ["dusty" if p == 1 else "clear" for p in preds]
 
-    # Map basename -> predicted label
-    pred_map = {os.path.basename(p): lab for p, lab in zip(future_paths, labels)}
+    # Normalize keys: lowercase basenames
+    def normname(p):
+        return os.path.basename(p).strip().lstrip("\ufeff").lower()
+    pred_map = {normname(p): lab for p, lab in zip(future_paths, labels)}
 
-    # 2) Read prediction CSV, fill label column, and write back in-place
+    # 2) Read CSV
     if not os.path.isfile(prediction_csv):
         raise FileNotFoundError(f"Missing prediction CSV: {prediction_csv}")
 
     rows = []
     with open(prediction_csv, "r", newline="") as f:
         rdr = csv.reader(f)
-        for row in rdr:
-            rows.append(row)
+        rows = list(rdr)
 
     if not rows:
         print(f"{prediction_csv} is empty.")
         return
 
-    # Expecting header like: ["image", "label", "date"]
-    header = rows[0]
-    if len(header) < 3:
-        # normalize header if needed
+    # Determine if first row is header or data
+    def looks_like_filename(s):
+        s = (s or "").strip().lstrip("\ufeff").lower()
+        return any(s.endswith(ext) for ext in exts)
+
+    start_idx = 0
+    if not looks_like_filename(rows[0][0] if rows[0] else ""):
+        # Treat row 0 as header; also normalize header columns length
+        header = rows[0]
         while len(header) < 3:
             header.append("")
         header[0] = header[0] or "image"
         header[1] = header[1] or "label"
         header[2] = header[2] or "date"
         rows[0] = header
+        start_idx = 1  # skip header when filling
 
-    # Update each row’s label if we have a prediction for its image
-    for i in range(1, len(rows)):
+    # 3) Fill labels
+    filled = 0
+    for i in range(start_idx, len(rows)):
         row = rows[i]
         if not row:
             continue
         while len(row) < 3:
             row.append("")
-        img_name = (row[0] or "").strip()
-        if img_name in pred_map:
-            row[1] = pred_map[img_name]  # fill middle label column
+        img_name = (row[0] or "").strip().lstrip("\ufeff")
+        key = img_name.lower()
+        if key in pred_map:
+            row[1] = pred_map[key]
+            filled += 1
         rows[i] = row
 
-    # Write back in-place
     with open(prediction_csv, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerows(rows)
+        csv.writer(f).writerows(rows)
 
-    print(f"Filled labels for matching images in '{prediction_csv}'.")
-# ---------------------------------------------------------------
+    print(f"Filled labels for {filled} rows in '{prediction_csv}'.")
 
 def main():
     random.seed(SEED); np.random.seed(SEED); tf.random.set_seed(SEED)
