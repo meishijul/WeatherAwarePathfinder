@@ -11,6 +11,9 @@ from tf_keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
 from tf_keras.applications.mobilenet_v2 import MobileNetV2, preprocess_input
 from sklearn.model_selection import train_test_split
 from collections import Counter
+from datetime import datetime, timedelta
+from collections import defaultdict
+
 
 # ---------------- Config ----------------
 CSV_PATH        = "OctoberHackathonData.csv"
@@ -182,6 +185,95 @@ def predict_and_fill_labels(model, future_dir, prediction_csv):
 
     print(f"Filled labels for {filled} rows in '{prediction_csv}'.")
 
+def _parse_date_str(s):
+    """
+    Try a few common date formats and return a date object.
+    Returns None if parsing fails.
+    """
+    if not s:
+        return None
+    s = s.strip()
+    fmts = [
+        "%Y-%m-%d",     # 2025-10-24
+        "%m/%d/%Y",     # 10/24/2025
+        "%m/%d/%y",     # 10/24/25
+        "%Y/%m/%d",     # 2025/10/24
+    ]
+    for fmt in fmts:
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            pass
+    return None
+
+def build_10day_forecast_from_csv(prediction_csv, out_csv="ten_day_forecast.csv", days=10):
+    """
+    Reads PredictionImages.csv (image,label,date), aggregates per-date labels
+    over the next `days` days starting from today, and writes a daily forecast CSV:
+    columns: date, label, prob_dusty, n_images
+    """
+    if not os.path.isfile(prediction_csv):
+        print(f"[10-day] Missing prediction CSV: {prediction_csv}")
+        return
+
+    with open(prediction_csv, "r", newline="") as f:
+        rdr = csv.reader(f)
+        rows = list(rdr)
+
+    if not rows:
+        print(f"[10-day] {prediction_csv} is empty.")
+        return
+
+    # Determine if first row is a header
+    header = rows[0] if rows and rows[0] else []
+    start_idx = 0
+    if header and ("image" in [c.strip().lower() for c in header]) and len(header) >= 3:
+        start_idx = 1
+
+    # Collect per-date labels (1=dusty, 0=clear) for rows that have a parseable date
+    per_date = defaultdict(list)
+    for i in range(start_idx, len(rows)):
+        row = rows[i]
+        if not row: 
+            continue
+        while len(row) < 3:
+            row.append("")
+        _, lbl, dstr = row[0], (row[1] or "").strip().lower(), row[2]
+        d = _parse_date_str(dstr)
+        if d is None:
+            continue
+        if lbl not in ("dusty", "clear"):
+            continue
+        per_date[d].append(1 if lbl == "dusty" else 0)
+
+    # Build the 10-day window starting today
+    today = datetime.now().date()
+    horizon = [today + timedelta(days=k) for k in range(days)]
+
+    # Aggregate and write out
+    out_rows = [["date", "label", "prob_dusty", "n_images"]]
+    for d in horizon:
+        vals = per_date.get(d, [])
+        if len(vals) == 0:
+            # No images for that date → leave prob blank and mark label as ""
+            out_rows.append([d.isoformat(), "", "", 0])
+            continue
+        prob = float(sum(vals)) / float(len(vals))
+        label = "dusty" if prob >= 0.5 else "clear"
+        out_rows.append([d.isoformat(), label, f"{prob:.3f}", len(vals)])
+
+    with open(out_csv, "w", newline="") as f:
+        csv.writer(f).writerows(out_rows)
+
+    # Print a quick summary
+    print(f"\n10-day forecast → {out_csv}")
+    for r in out_rows[1:]:
+        d, lab, p, n = r
+        if n == 0:
+            print(f"{d}: no data")
+        else:
+            print(f"{d}: {lab:5s} (prob_dusty={p}, n_images={n})")
+
 def main():
     random.seed(SEED); np.random.seed(SEED); tf.random.set_seed(SEED)
 
@@ -249,6 +341,10 @@ def main():
 
     # --- NEW: predict on futureimages/ and write labels into predictionimages.csv ---
     predict_and_fill_labels(model, FUTURE_DIR, PREDICTION_CSV)
+
+    # --- NEW: build a 10-day (today → +9) daily forecast from PredictionImages.csv ---
+    build_10day_forecast_from_csv(PREDICTION_CSV, out_csv="ten_day_forecast.csv", days=10)
+
 
 if __name__ == "__main__":
     main()
