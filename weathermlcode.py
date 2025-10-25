@@ -3,12 +3,11 @@ import numpy as np
 from sklearn.model_selection import train_test_split
 from transformers import TFSegformerForSemanticSegmentation, SegformerFeatureExtractor
 
-from keras import Model
-from keras.layers import Input, Conv2D, MaxPooling2D, UpSampling2D, Concatenate
-from keras.optimizers import Adam
-from keras.preprocessing.image import ImageDataGenerator   # ok in Keras 3
-from keras.utils import to_categorical, load_img, img_to_array
-
+from tf_keras import Model
+from tf_keras.layers import Input, Conv2D, MaxPooling2D, UpSampling2D, Concatenate
+from tf_keras.optimizers import Adam
+from tf_keras.preprocessing.image import ImageDataGenerator  
+from tf_keras.utils import to_categorical, load_img, img_to_array
 
 # Path to the CSV file
 csv_file_path = 'OctoberHackathonData.csv'
@@ -16,6 +15,7 @@ csv_file_path = 'OctoberHackathonData.csv'
 # Lists to store the data
 image_names = []
 classifications = []
+dates = []
 
 # Read the CSV file
 try:
@@ -28,10 +28,12 @@ try:
         for row in csv_reader:
             image_names.append(row[0])  # First column: Image name
             classifications.append(row[1])  # Second column: Classification (dusty/clear)
+            dates.append(row[2])  # Third column: Dates
     
     # Print the extracted data
     print("Image Names:", image_names)
     print("Classifications:", classifications)
+    print("Dates:", dates)
 
 except Exception as e:
     print(f"An error occurred: {e}")
@@ -71,12 +73,12 @@ except Exception as e:
 
                 # Decoder
                 up1 = UpSampling2D(size=(2, 2))(conv3)
-                up1 = concatenate([up1, conv2], axis=-1)
+                up1 = Concatenate([up1, conv2], axis=-1)
                 conv4 = Conv2D(128, (3, 3), activation='relu', padding='same')(up1)
                 conv4 = Conv2D(128, (3, 3), activation='relu', padding='same')(conv4)
 
                 up2 = UpSampling2D(size=(2, 2))(conv4)
-                up2 = concatenate([up2, conv1], axis=-1)
+                up2 = Concatenate([up2, conv1], axis=-1)
                 conv5 = Conv2D(64, (3, 3), activation='relu', padding='same')(up2)
                 conv5 = Conv2D(64, (3, 3), activation='relu', padding='same')(conv5)
 
