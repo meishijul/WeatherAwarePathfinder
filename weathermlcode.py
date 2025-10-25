@@ -1,14 +1,14 @@
-import csv
-import os
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, Conv2D, MaxPooling2D, UpSampling2D, concatenate
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
+import csv, os
 import numpy as np
-from tensorflow.keras.utils import to_categorical
 from sklearn.model_selection import train_test_split
-from tensorflow.keras.preprocessing.image import load_img, img_to_array
 from transformers import TFSegformerForSemanticSegmentation, SegformerFeatureExtractor
+
+from keras import Model
+from keras.layers import Input, Conv2D, MaxPooling2D, UpSampling2D, Concatenate
+from keras.optimizers import Adam
+from keras.preprocessing.image import ImageDataGenerator   # ok in Keras 3
+from keras.utils import to_categorical, load_img, img_to_array
+
 
 # Path to the CSV file
 csv_file_path = 'OctoberHackathonData.csv'
