@@ -16,7 +16,7 @@ from collections import Counter
 CSV_PATH        = "OctoberHackathonData.csv"
 IMAGES_DIR      = "images"
 FUTURE_DIR      = "futureimages"          # <- predict on these
-PREDICTION_CSV  = "predictionimages.csv"  # columns: image,label,date (label empty initially)
+PREDICTION_CSV  = "PredictionImages.csv"  # columns: image,label,date (label empty initially)
 INPUT_SIZE      = (224, 224)              # H,W for MobileNetV2
 BATCH_SIZE      = 32
 EPOCHS          = 12
