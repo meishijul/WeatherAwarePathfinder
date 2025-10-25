@@ -1,11 +1,18 @@
-# MarsGui.py — Single-file app: minimal controls + auto Dusty/Clear + inline model/JSON override
+# MarsGui.py — 2×2 layout, minimal controls + CSV-backed Dusty/Clear
+# Rolling week: ALWAYS uses tomorrow .. +6 days (7 total).
+# Reads ten_day_forecast.csv (date,label,prob_dusty,...) and maps those dates to Dusty/Clear.
+
 import math
-import io, csv, json, os
-from datetime import datetime, timedelta
+import os, io, json, csv as _csv
+from datetime import datetime, timedelta, date as _date
 
 import numpy as np
 import streamlit as st
 import matplotlib.pyplot as plt
+
+# ==== Rolling week window (starts tomorrow) ====
+START_DATE = _date.today() + timedelta(days=1)  # inclusive
+NUM_DAYS   = 7                                  # tomorrow .. +6
 
 # ---------- Fixed background constants (kept out of UI) ----------
 DERATE        = 0.90     # wiring/inverter loss
@@ -23,67 +30,126 @@ def daily_energy_wh(is_dusty: bool, area_m2: float, eta: float) -> float:
     T_panel = 1.0 - BETA_SOILING if is_dusty else 1.0
     return area_m2 * eta * DERATE * ins_clear_Wh_m2 * T_atm * T_panel
 
-# ---------- Auto "dustiness" heuristic (fallback) ----------
-def auto_dust_flags_for_week(base_prob: float = 0.35, jitter: float = 0.10):
-    """Return 7 booleans (Dusty=True) for today..+6 using a smooth probability pattern."""
-    today = datetime.now().date()
-    rng = np.random.RandomState(today.toordinal())  # deterministic per day
+# ---------- Fallback heuristic (only used if no CSV/inline/JSON) ----------
+def auto_dust_flags_for_range(start: _date, num_days: int, base_prob=0.35, jitter=0.10):
+    rng = np.random.RandomState(start.toordinal())  # deterministic per start date
     flags = []
-    for i in range(7):
+    for i in range(num_days):
         p = base_prob + 0.15 * math.sin(i * math.pi / 3) + rng.uniform(-jitter, jitter)
         p = min(1.0, max(0.0, p))
         flags.append(rng.rand() < p)
     return flags
 
-# ---------- Inline model hook (SINGLE-FILE OVERRIDE) ----------
+# ---------- Optional inline hook (single-file model override; return 7 booleans or None) ----------
 def predict_dust_week_inline():
-    """
-    RETURN exactly 7 booleans for today..+6 (True=Dusty, False=Clear),
-    OR return None to skip. Replace the body with your real model call.
-    """
-    # Example (disabled): return [True, False, False, True, False, True, False]
+    # Example (disabled): return [True, False, False, True, True, False, False]
     return None
 
-# ---------- JSON override loader (SINGLE-FILE, no import needed) ----------
+# ---------- Optional JSON override loader ----------
 def load_dust_flags_from_json(path="predictions.json"):
-    """
-    If a JSON file is present with {"dusty":[true/false x7]}, use it.
-    Return list[bool] or None if missing/invalid.
-    """
     if not os.path.exists(path):
         return None
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         arr = data.get("dusty", [])
-        if not isinstance(arr, list) or len(arr) < 7:
+        if isinstance(arr, list) and len(arr) >= NUM_DAYS:
+            return [bool(x) for x in arr[:NUM_DAYS]]
+    except Exception:
+        pass
+    return None
+
+# ---------- CSV loader for your AI output (uses ONLY dates in the rolling window) ----------
+def _parse_bool_from_row(row, prob_threshold=0.5):
+    keys = {k.lower(): k for k in row.keys()}
+    # Prefer an explicit label if present
+    lbl_key = keys.get("label")
+    if lbl_key is not None:
+        v = str(row[lbl_key]).strip().lower()
+        return v in ("dust", "dusty", "storm", "dust_storm", "true", "1", "yes")
+    # Otherwise use probability if present
+    pkey = keys.get("prob_dusty")
+    if pkey is not None:
+        try:
+            return float(row[pkey]) >= float(prob_threshold)
+        except Exception:
             return None
-        return [bool(x) for x in arr[:7]]
+    return None
+
+def load_dust_flags_from_csv(path="ten_day_forecast.csv", prob_threshold=0.5):
+    if not os.path.exists(path):
+        return None
+
+    wanted = {START_DATE + timedelta(days=i) for i in range(NUM_DAYS)}
+    mapping = {}  # date -> bool
+    try:
+        with open(path, newline="", encoding="utf-8") as f:
+            reader = _csv.DictReader(f)
+            for row in reader:
+                dkey = next((k for k in row if k and k.lower() in ("date", "date_label", "date_str")), None)
+                if not dkey:
+                    continue
+                try:
+                    d = datetime.fromisoformat(str(row[dkey]).strip()).date()
+                except Exception:
+                    continue
+                if d not in wanted:
+                    continue
+                val = _parse_bool_from_row(row, prob_threshold=prob_threshold)
+                if val is not None:
+                    mapping[d] = bool(val)
     except Exception:
         return None
 
-# ---------- Unified source of truth for dust flags ----------
-def get_dust_flags_for_week():
-    """
-    Priority:
-      1) predictions.json (if present & valid)
-      2) predict_dust_week_inline() if it returns 7 booleans
-      3) auto_dust_flags_for_week() fallback
-    """
+    # Build ordered list for the rolling week; allow gaps
+    flags = [mapping.get(START_DATE + timedelta(days=i), None) for i in range(NUM_DAYS)]
+    if not any(x in (True, False) for x in flags):
+        return None
+
+    # Fill gaps: forward then backward; leftover Nones -> fallback heuristic for that day
+    last = None
+    for i in range(NUM_DAYS):
+        if flags[i] is None and last is not None:
+            flags[i] = last
+        else:
+            last = flags[i] if flags[i] is not None else last
+    nxt = None
+    for i in range(NUM_DAYS - 1, -1, -1):
+        if flags[i] is None and nxt is not None:
+            flags[i] = nxt
+        else:
+            nxt = flags[i] if flags[i] is not None else nxt
+    if any(x is None for x in flags):
+        auto = auto_dust_flags_for_range(START_DATE, NUM_DAYS)
+        flags = [auto[i] if flags[i] is None else flags[i] for i in range(NUM_DAYS)]
+
+    return [bool(x) for x in flags]
+
+# ---------- Unified source of truth (CSV > JSON > inline > heuristic) ----------
+def get_dust_flags_for_range():
+    flags = load_dust_flags_from_csv("ten_day_forecast.csv", prob_threshold=0.5)
+    if flags is not None:
+        return flags
+
     flags = load_dust_flags_from_json()
     if flags is not None:
         return flags
+
     try:
         flags = predict_dust_week_inline()
-        if isinstance(flags, (list, tuple)) and len(flags) >= 7:
-            return [bool(x) for x in flags[:7]]
+        if isinstance(flags, (list, tuple)) and len(flags) >= NUM_DAYS:
+            return [bool(x) for x in flags[:NUM_DAYS]]
     except Exception:
         pass
-    return auto_dust_flags_for_week(base_prob=0.35, jitter=0.10)
+
+    return auto_dust_flags_for_range(START_DATE, NUM_DAYS)
 
 # ---------- UI ----------
-st.set_page_config(page_title="Mars Dust Calendar", layout="wide")
-st.title("🔴 Mars 7-Day Dust Calendar")
+st.set_page_config(page_title="Mars Dust Calendar (Rolling Week)", layout="wide")
+
+end_date = START_DATE + timedelta(days=NUM_DAYS - 1)
+week_label = f"{START_DATE.strftime('%b %d')}–{end_date.strftime('%b %d')}"
+st.title(f"🔴 Mars 7-Day Dust Calendar — {week_label}")
 
 left_col, right_col = st.columns(2)
 
@@ -103,19 +169,18 @@ with left_col:
         total_area_m2 = float(n_panels) * float(area_per_panel)
         st.metric("Total array area", f"{total_area_m2:.2f} m²")
 
-    # Bottom-left: Week view (auto or overridden)
+    # Bottom-left: Week view (rolling)
     with st.container():
-        st.subheader("This Week")
-        dust_flags = get_dust_flags_for_week()
-        today = datetime.now().date()
-        days = [today + timedelta(days=i) for i in range(7)]
+        st.subheader(f"This Week ({START_DATE.strftime('%b %d')} → {end_date.strftime('%b %d')})")
+        dust_flags = get_dust_flags_for_range()
+        days = [START_DATE + timedelta(days=i) for i in range(NUM_DAYS)]
 
         # Weekly summary
         n_dusty = sum(dust_flags)
-        n_clear = 7 - n_dusty
+        n_clear = NUM_DAYS - n_dusty
         st.metric("Weekly summary", f"{n_clear} clear / {n_dusty} dusty")
 
-        # Date + badge list (serious looking pills)
+        # Date + badge list
         for d, dusty in zip(days, dust_flags):
             label = "Dusty" if dusty else "Clear"
             color = "#eab308" if dusty else "#22c55e"   # amber / green
@@ -135,26 +200,27 @@ with right_col:
     # Top-right: Daily Energy + total
     with st.container():
         st.subheader("Daily Energy (Wh)")
-        st.metric("Total for 7 days (Wh)", f"{total_wh:,.0f}")
+        st.metric(f"Total for {week_label} (Wh)", f"{total_wh:,.0f}")
         for d, e, dusty in zip(days, daily_wh, dust_flags):
             st.write(f"**{d.strftime('%a %b %d')}** — {'Dusty' if dusty else 'Clear'}: {e:,.0f} Wh")
 
-        # Download CSV (handy for judges)
-        buf = io.StringIO()
-        w = csv.writer(buf)
+        # Download CSV with results
+        out = io.StringIO()
+        w = _csv.writer(out)
         w.writerow(["Date", "Status", "Energy_Wh"])
         for d, dusty, e in zip(days, dust_flags, daily_wh):
             w.writerow([d.isoformat(), "Dusty" if dusty else "Clear", int(e)])
-        st.download_button("Download CSV", buf.getvalue(), "week_energy.csv", "text/csv")
+        st.download_button(f"Download week energy ({week_label})", out.getvalue(),
+                           f"week_energy_{START_DATE.isoformat()}_to_{end_date.isoformat()}.csv", "text/csv")
 
     # Bottom-right: Energy chart
     with st.container():
         st.subheader("Daily Energy Chart")
         fig, ax = plt.subplots(figsize=(8, 3))
-        ax.bar([d.strftime("%a") for d in days], daily_wh)
+        ax.bar([d.strftime("%a %d") for d in days], daily_wh)
         ax.set_ylabel("Energy (Wh)")
         ax.grid(True, axis="y", alpha=0.3)
         st.pyplot(fig)
 
 # Footer
-st.caption("Energy ≈ (Total Area × η × derate) × [I_peak × (2/π) × daylight] × (dust penalties when Dusty).")
+st.caption("Energy ≈ (Total Area × η × derate) × [I_peak × (2/π) × daylight] × dust penalties when Dusty.")
