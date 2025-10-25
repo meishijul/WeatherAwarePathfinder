@@ -1,4 +1,5 @@
 import csv
+import os
 
 # Path to the CSV file
 csv_file_path = 'OctoberHackathonData.csv'
@@ -23,9 +24,22 @@ try:
     print("Image Names:", image_names)
     print("Classifications:", classifications)
 
-except FileNotFoundError:
-    print(f"Error: The file '{csv_file_path}' was not found.")
-except IndexError:
-    print("Error: The CSV file does not have the expected number of columns.")
 except Exception as e:
     print(f"An error occurred: {e}")
+    # Verify if the images exist in the 'images' folder
+
+    images_folder_path = 'images'
+    missing_images = []
+
+    for image_name in image_names:
+        image_path = os.path.join(images_folder_path, image_name)
+        if not os.path.isfile(image_path):
+            missing_images.append(image_name)
+
+    if missing_images:
+        print("The following images are missing in the 'images' folder:", missing_images)
+    else:
+        print("All images are present in the 'images' folder.")
+        # Print each image name with its corresponding label
+        for image_name, classification in zip(image_names, classifications):
+            print(f"Image: {image_name}, Label: {classification}")
