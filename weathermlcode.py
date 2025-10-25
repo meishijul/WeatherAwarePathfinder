@@ -1,171 +1,239 @@
-import csv, os
+# dust_classifier.py
+import os, csv, random
 import numpy as np
-from sklearn.model_selection import train_test_split
-from transformers import TFSegformerForSemanticSegmentation, SegformerFeatureExtractor
 
+# Use tf-keras (plays nice with tensorflow-macos 2.16.2)
+import tensorflow as tf
 from tf_keras import Model
-from tf_keras.layers import Input, Conv2D, MaxPooling2D, UpSampling2D, Concatenate
+from tf_keras.layers import Dense, Dropout, GlobalAveragePooling2D, Input
 from tf_keras.optimizers import Adam
-from tf_keras.preprocessing.image import ImageDataGenerator  
-from tf_keras.utils import to_categorical, load_img, img_to_array
-from transformers import TFUNetForImageSegmentation, UNetFeatureExtractor
+from tf_keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
+from tf_keras.applications.mobilenet_v2 import MobileNetV2, preprocess_input
+from sklearn.model_selection import train_test_split
+from collections import Counter
 
-# Path to the CSV file
-csv_file_path = 'OctoberHackathonData.csv'
+# ---------------- Config ----------------
+CSV_PATH        = "OctoberHackathonData.csv"
+IMAGES_DIR      = "images"
+FUTURE_DIR      = "futureimages"          # <- predict on these
+PREDICTION_CSV  = "predictionimages.csv"  # columns: image,label,date (label empty initially)
+INPUT_SIZE      = (224, 224)              # H,W for MobileNetV2
+BATCH_SIZE      = 32
+EPOCHS          = 12
+MODEL_PATH      = "dusty_clear_mobilenetv2.h5"
+SEED            = 42
+# ----------------------------------------
 
-# Lists to store the data
-image_names = []
-classifications = []
-dates = []
+def read_csv_rows(csv_path):
+    names, labels, dates = [], [], []
+    with open(csv_path, "r") as f:
+        reader = csv.reader(f)
+        header = next(reader, None)  # skip header if present
+        for row in reader:
+            if not row: continue
+            names.append(row[0].strip())
+            labels.append(row[1].strip().lower())
+            dates.append(row[2].strip() if len(row) > 2 else "")
+    return names, labels, dates
 
-# Read the CSV file
-try:
-    with open(csv_file_path, mode='r') as file:
-        csv_reader = csv.reader(file)
-        # Skip the header row if it exists
-        header = next(csv_reader)
-        
-        # Extract the first two columns
-        for row in csv_reader:
-            image_names.append(row[0])  # First column: Image name
-            classifications.append(row[1])  # Second column: Classification (dusty/clear)
-            dates.append(row[2])  # Third column: Dates
-    
-    # Print the extracted data
-    print("Image Names:", image_names)
-    print("Classifications:", classifications)
-    print("Dates:", dates)
+def build_dataset_lists(names, labels):
+    paths, y = [], []
+    for name, lab in zip(names, labels):
+        p = os.path.join(IMAGES_DIR, name)
+        if os.path.isfile(p):
+            paths.append(p)
+            y.append(1 if lab == "dusty" else 0)  # 1=dusty, 0=clear
+    return paths, np.array(y, dtype=np.int32)
 
-except Exception as e:
-    print(f"An error occurred: {e}")
-    # Verify if the images exist in the 'images' folder
+def tf_load_img(path, target_hw):
+    img = tf.io.read_file(path)
+    img = tf.image.decode_image(img, channels=3, expand_animations=False)
+    img = tf.image.resize(img, target_hw)
+    img = tf.cast(img, tf.float32)
+    # preprocess_input expects [-1,1] scaling for MobileNetV2
+    img = preprocess_input(img)
+    return img
 
-    images_folder_path = 'images'
-    missing_images = []
+def make_dataset(paths, labels=None, training=False):
+    ds = tf.data.Dataset.from_tensor_slices(paths)
+    ds = ds.map(lambda p: (tf_load_img(p, INPUT_SIZE), p),
+                num_parallel_calls=tf.data.AUTOTUNE)
+    if training:
+        # light aug: flips + small jitter
+        def aug(img, p):
+            img = tf.image.random_flip_left_right(img)
+            img = tf.image.random_brightness(img, 0.05)
+            img = tf.image.random_contrast(img, 0.95, 1.05)
+            return img, p
+        ds = ds.map(aug, num_parallel_calls=tf.data.AUTOTUNE)
+    if labels is not None:
+        lbls = tf.convert_to_tensor(labels, dtype=tf.int32)
+        ds_lbl = tf.data.Dataset.from_tensor_slices(lbls)
+        ds = tf.data.Dataset.zip((ds, ds_lbl)).map(
+            lambda tup, y: (tup[0], y), num_parallel_calls=tf.data.AUTOTUNE
+        )
+    ds = ds.shuffle(1000, seed=SEED) if training else ds
+    ds = ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+    return ds
 
-    for image_name in image_names:
-        image_path = os.path.join(images_folder_path, image_name)
-        if not os.path.isfile(image_path):
-            missing_images.append(image_name)
+def build_model(input_shape=(224,224,3)):
+    base = MobileNetV2(input_shape=input_shape, include_top=False, weights="imagenet")
+    base.trainable = False  # start by freezing backbone
+    x = GlobalAveragePooling2D()(base.output)
+    x = Dropout(0.2)(x)
+    out = Dense(1, activation="sigmoid")(x)
+    m = Model(base.input, out)
+    m.compile(optimizer=Adam(1e-4), loss="binary_crossentropy", metrics=["accuracy"])
+    return m
 
-    if missing_images:
-        print("The following images are missing in the 'images' folder:", missing_images)
-    else:
-        print("All images are present in the 'images' folder.")
-        # Print each image name with its corresponding label
-        for image_name, classification in zip(image_names, classifications):
-            print(f"Image: {image_name}, Label: {classification}")
-            # Define U-Net model
-            def unet_model(input_size=(128, 128, 3)):
-                inputs = Input(input_size)
+# ---------- NEW: helpers to update predictionimages.csv ----------
+def list_image_paths(folder):
+    if not os.path.isdir(folder):
+        return []
+    exts = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
+    return [
+        os.path.join(folder, f)
+        for f in os.listdir(folder)
+        if f.lower().endswith(exts) and os.path.isfile(os.path.join(folder, f))
+    ]
 
-                # Encoder
-                conv1 = Conv2D(64, (3, 3), activation='relu', padding='same')(inputs)
-                conv1 = Conv2D(64, (3, 3), activation='relu', padding='same')(conv1)
-                pool1 = MaxPooling2D(pool_size=(2, 2))(conv1)
+def predict_and_fill_labels(model, future_dir, prediction_csv):
+    """
+    Reads predictionimages.csv (columns: image, label, date),
+    predicts labels for images in future_dir, and writes labels into the middle column.
+    """
+    # 1) Collect all future images and make predictions
+    future_paths = list_image_paths(future_dir)
+    if not future_paths:
+        print(f"No images found in '{future_dir}'. Skipping future inference.")
+        return
 
-                conv2 = Conv2D(128, (3, 3), activation='relu', padding='same')(pool1)
-                conv2 = Conv2D(128, (3, 3), activation='relu', padding='same')(conv2)
-                pool2 = MaxPooling2D(pool_size=(2, 2))(conv2)
+    ds = (
+        tf.data.Dataset.from_tensor_slices(future_paths)
+        .map(lambda p: tf_load_img(p, INPUT_SIZE), num_parallel_calls=tf.data.AUTOTUNE)
+        .batch(BATCH_SIZE)
+        .prefetch(tf.data.AUTOTUNE)
+    )
 
-                # Bottleneck
-                conv3 = Conv2D(256, (3, 3), activation='relu', padding='same')(pool2)
-                conv3 = Conv2D(256, (3, 3), activation='relu', padding='same')(conv3)
+    probs = model.predict(ds, verbose=0).ravel()
+    preds = (probs >= 0.5).astype(int)
+    labels = ["dusty" if p == 1 else "clear" for p in preds]
 
-                # Decoder
-                up1 = UpSampling2D(size=(2, 2))(conv3)
-                up1 = Concatenate([up1, conv2], axis=-1)
-                conv4 = Conv2D(128, (3, 3), activation='relu', padding='same')(up1)
-                conv4 = Conv2D(128, (3, 3), activation='relu', padding='same')(conv4)
+    # Map basename -> predicted label
+    pred_map = {os.path.basename(p): lab for p, lab in zip(future_paths, labels)}
 
-                up2 = UpSampling2D(size=(2, 2))(conv4)
-                up2 = Concatenate([up2, conv1], axis=-1)
-                conv5 = Conv2D(64, (3, 3), activation='relu', padding='same')(up2)
-                conv5 = Conv2D(64, (3, 3), activation='relu', padding='same')(conv5)
+    # 2) Read prediction CSV, fill label column, and write back in-place
+    if not os.path.isfile(prediction_csv):
+        raise FileNotFoundError(f"Missing prediction CSV: {prediction_csv}")
 
-                outputs = Conv2D(1, (1, 1), activation='sigmoid')(conv5)
+    rows = []
+    with open(prediction_csv, "r", newline="") as f:
+        rdr = csv.reader(f)
+        for row in rdr:
+            rows.append(row)
 
-                model = Model(inputs=[inputs], outputs=[outputs])
-                model.compile(optimizer=Adam(learning_rate=1e-4), loss='binary_crossentropy', metrics=['accuracy'])
+    if not rows:
+        print(f"{prediction_csv} is empty.")
+        return
 
-                return model
+    # Expecting header like: ["image", "label", "date"]
+    header = rows[0]
+    if len(header) < 3:
+        # normalize header if needed
+        while len(header) < 3:
+            header.append("")
+        header[0] = header[0] or "image"
+        header[1] = header[1] or "label"
+        header[2] = header[2] or "date"
+        rows[0] = header
 
-            # Load and preprocess images
-            def load_images(folder_path, image_names, labels, target_size=(128, 128)):
-                images = []
-                for image_name in image_names:
-                    image_path = os.path.join(folder_path, image_name)
-                    img = load_img(image_path, target_size=target_size)
-                    img_array = img_to_array(img) / 255.0
-                    images.append(img_array)
-                images = np.array(images)
-                labels = np.array([1 if label == 'dusty' else 0 for label in labels])
-                labels = to_categorical(labels, num_classes=2)
-                return images, labels
+    # Update each row’s label if we have a prediction for its image
+    for i in range(1, len(rows)):
+        row = rows[i]
+        if not row:
+            continue
+        while len(row) < 3:
+            row.append("")
+        img_name = (row[0] or "").strip()
+        if img_name in pred_map:
+            row[1] = pred_map[img_name]  # fill middle label column
+        rows[i] = row
 
-            # Paths
-            future_images_folder = 'futureimages'
+    # Write back in-place
+    with open(prediction_csv, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerows(rows)
 
-            # Load images and labels
-            X, y = load_images(future_images_folder, image_names, classifications)
+    print(f"Filled labels for matching images in '{prediction_csv}'.")
+# ---------------------------------------------------------------
 
-            # Split data into training and validation sets
-            X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+def main():
+    random.seed(SEED); np.random.seed(SEED); tf.random.set_seed(SEED)
 
-            # Initialize and train the model
-            model = unet_model()
-            model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=10, batch_size=16)
+    if not os.path.isfile(CSV_PATH):
+        raise FileNotFoundError(f"Missing CSV at {CSV_PATH}")
+    if not os.path.isdir(IMAGES_DIR):
+        raise FileNotFoundError(f"Missing images folder at {IMAGES_DIR}/")
 
-            # Load a pre-trained U-Net model from Hugging Face
-            # Initialize the feature extractor and model
-            feature_extractor = UNetFeatureExtractor.from_pretrained("hf-internal-testing/tiny-random-unet")
-            model = TFUNetForImageSegmentation.from_pretrained("hf-internal-testing/tiny-random-unet")
+    names, labels_txt, dates = read_csv_rows(CSV_PATH)
+    paths, y = build_dataset_lists(names, labels_txt)
+    if len(paths) == 0:
+        raise RuntimeError("No valid images found from CSV in images/ directory.")
 
-            # Preprocess images for the U-Net model
-            def preprocess_images_unet(image_paths, feature_extractor):
-                images = []
-                for image_path in image_paths:
-                    img = load_img(image_path)
-                    img_array = img_to_array(img) / 255.0
-                    images.append(img_array)
-                inputs = feature_extractor(images, return_tensors="tf")
-                return inputs
+    print(f"Total images: {len(paths)} | Label counts: {Counter(y)}")
 
-            # Load and preprocess future images
-            future_image_paths = [os.path.join(future_images_folder, img) for img in image_names]
-            inputs = preprocess_images_unet(future_image_paths, feature_extractor)
+    X_train, X_val, y_train, y_val = train_test_split(
+        paths, y, test_size=0.2, random_state=SEED, stratify=y
+    )
 
-            # Perform inference on future images
-            outputs = model(**inputs)
-            predictions = np.argmax(outputs.logits, axis=-1)
+    train_ds = make_dataset(X_train, y_train, training=True)
+    val_ds   = make_dataset(X_val,   y_val,   training=False)
 
-            # Print predictions for future images
-            for image_name, prediction in zip(image_names, predictions):
-                label = "dusty" if prediction == 1 else "clear"
-                print(f"Image: {image_name}, Predicted Label: {label}")
-            model.save('unet_model.h5')
-            # Load a pre-trained Segformer model from Hugging Face
-            feature_extractor = SegformerFeatureExtractor.from_pretrained("nvidia/segformer-b0-finetuned-ade-512-512")
-            model = TFSegformerForSemanticSegmentation.from_pretrained("nvidia/segformer-b0-finetuned-ade-512-512")
+    model = build_model((INPUT_SIZE[0], INPUT_SIZE[1], 3))
+    model.summary()
 
-            # Preprocess images for the Segformer model
-            def preprocess_images(image_paths, target_size=(512, 512)):
-                images = []
-                for image_path in image_paths:
-                    img = load_img(image_path, target_size=target_size)
-                    img_array = img_to_array(img) / 255.0
-                    images.append(img_array)
-                return np.array(images)
+    # Optional class weights for imbalance
+    counts = Counter(y_train)
+    total = sum(counts.values())
+    w0 = total / (2.0 * counts.get(0, 1))
+    w1 = total / (2.0 * counts.get(1, 1))
+    class_weights = {0: w0, 1: w1}
 
-            # Load and preprocess future images
-            future_image_paths = [os.path.join(future_images_folder, img) for img in image_names]
-            X_future = preprocess_images(future_image_paths)
+    cbs = [
+        ModelCheckpoint(MODEL_PATH, monitor="val_accuracy", save_best_only=True, verbose=1),
+        ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=2, verbose=1),
+        EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True, verbose=1),
+    ]
 
-            # Perform inference on future images
-            outputs = model.predict(X_future)
-            predictions = np.argmax(outputs.logits, axis=-1)
+    model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=EPOCHS,
+        class_weight=class_weights,
+        callbacks=cbs,                    # <- added callbacks
+        verbose=1
+    )
 
-            # Print predictions for future images
-            for image_name, prediction in zip(image_names, predictions):
-                label = "dusty" if prediction == 1 else "clear"
-                print(f"Image: {image_name}, Predicted Label: {label}")
+    # Save final best model
+    model.save(MODEL_PATH)
+    print(f"Saved model to {MODEL_PATH}")
+
+    # Quick sanity predictions on a few val samples
+    sample_paths = X_val[:8]
+    sample_ds = (
+        tf.data.Dataset.from_tensor_slices(sample_paths)
+        .map(lambda p: tf_load_img(p, INPUT_SIZE), num_parallel_calls=tf.data.AUTOTUNE)
+        .batch(BATCH_SIZE)
+    )
+    probs = model.predict(sample_ds, verbose=0).ravel()
+    preds = (probs >= 0.5).astype(int)
+
+    print("\nSample predictions:")
+    for p, pr, pb in zip(sample_paths, preds, probs):
+        print(f"{os.path.basename(p):30s}  pred={'dusty' if pr==1 else 'clear'}  prob={pb:.3f}")
+
+    # --- NEW: predict on futureimages/ and write labels into predictionimages.csv ---
+    predict_and_fill_labels(model, FUTURE_DIR, PREDICTION_CSV)
+
+if __name__ == "__main__":
+    main()
